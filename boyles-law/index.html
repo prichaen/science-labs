@@ -246,7 +246,7 @@
   </main>
 
   <footer>
-    <span class="store" id="store"><i></i><span id="storeTxt">저장소 확인 중…</span></span>
+    <span class="store" id="store" style="cursor:pointer" title="눌러서 연결 상태 보기"><i></i><span id="storeTxt">저장소 확인 중…</span></span>
     경기도화학교육연구회
     <button class="admin-btn" id="adminBtn" title="관리">
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -284,7 +284,7 @@
 
   /* ---------- helpers ---------- */
   const fmt = (x, d=1) => (x==null || !isFinite(x)) ? '–' : x.toLocaleString('ko-KR',{maximumFractionDigits:d, minimumFractionDigits:d});
-  const toast = t => { const el=$('toast'); el.textContent=t; el.classList.add('on'); clearTimeout(toast._t); toast._t=setTimeout(()=>el.classList.remove('on'),2200); };
+  const toast = (t, ms=2200) => { const el=$('toast'); el.textContent=t; el.classList.add('on'); clearTimeout(toast._t); toast._t=setTimeout(()=>el.classList.remove('on'),ms); };
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,8);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -597,6 +597,7 @@
   let sheetOk = null;          // null: 확인 중, true: 연결됨, false: 연결 끊김
   let pending = [];            // 아직 시트로 보내지 못한 작업
   let flushing = false;
+  let lastErr = '';
 
   function lsLoad(){ try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch(e){ return []; } }
   function lsSave(){ try { localStorage.setItem(LS_KEY, JSON.stringify(runs)); } catch(e){} }
@@ -637,8 +638,14 @@
     return withTimeout(async signal => {
       const res = await fetch(SHEET_URL + '?t=' + Date.now(), {cache:'no-store', redirect:'follow', signal});
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const arr = await res.json();
-      if (!Array.isArray(arr)) throw new Error('bad data');
+      const txt = await res.text();
+      let arr;
+      try { arr = JSON.parse(txt); }
+      catch(_){
+        const m = txt.match(/<title>([^<]*)<\/title>/i) || txt.match(/TypeError[^<]*|Exception[^<]*|Error[^<]*/);
+        throw new Error('JSON이 아닌 응답: ' + (m ? (m[1]||m[0]) : txt.slice(0,80)).trim());
+      }
+      if (!Array.isArray(arr)) throw new Error('목록이 아닌 응답: ' + txt.slice(0,80));
       return arr;
     }, 10000);
   }
@@ -668,7 +675,7 @@
         sheetOk = true;
         runs = applyPending(arr.filter(d => d && d.id).map(d => sanitize(d, d.id)));
         lsSave();
-      } catch(e){ sheetOk = false; }
+      } catch(e){ sheetOk = false; lastErr = (e && e.name==='AbortError') ? '응답 시간 초과(10초)' : String(e && e.message || e); }
       refreshing = null; rerender();
       return sheetOk;
     })();
@@ -723,6 +730,13 @@
     else lsSave();
     setStore(); renderRuns();
   }
+
+  $('store').addEventListener('click', () => {
+    if (mode !== 'sheet') return;
+    const id = SHEET_URL.split('/s/')[1] || '';
+    toast(sheetOk ? `연결됨 · 주소 …${id.slice(-12,-5)}` : `연결 끊김 · 주소 …${id.slice(-12,-5)} · ${lastErr || '확인 중'}`, 8000);
+    sheetRefresh();
+  });
 
   /* --- 시작 --- */
   runs = lsLoad();
