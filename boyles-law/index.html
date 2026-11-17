@@ -280,7 +280,7 @@
   let values = Array(15).fill(null);   // my pressures (index ↔ VOLS)
   let currentId = null;                // saved run id for this participant
   let runs = [];                       // all runs [{id,name,t,p:[]}]
-  let db = null, shared = false;
+  let db = null;
 
   /* ---------- helpers ---------- */
   const fmt = (x, d=1) => (x==null || !isFinite(x)) ? '–' : x.toLocaleString('ko-KR',{maximumFractionDigits:d, minimumFractionDigits:d});
@@ -463,7 +463,7 @@
     renderMine(); go(1);
   };
   $('back1').onclick = () => go(0);
-  $('goAvg').onclick = () => { renderAll(); go(2); };
+  $('goAvg').onclick = () => { renderAll(); go(2); if (mode==='sheet') sheetRefresh(); };
   $('back2').onclick = () => go(1);
   $('restart').onclick = () => {
     currentId=null; values=Array(15).fill(null); $('name').value=''; $('paste').value=''; setMsg(''); fillGrid(); go(0);
@@ -590,55 +590,172 @@
   }
 
   /* ---------- storage ---------- */
+  // 저장 우선순위: Google 스프레드시트(GitHub Pages 등) → claude.ai 공유 저장소 → 이 기기
+  const SHEET_URL = 'https://script.google.com/macros/s/AKfycbxbum7soSWGjG-LhEXHt-eh54tRf2lcx5cqT3-ohJZ2y2MGUHDYeycTA_OiJNiyYiXE/exec';
+  const PEND_KEY = 'boyle-pending-v1';
+  let mode = 'local';          // 'sheet' | 'db' | 'local'
+  let sheetOk = null;          // null: 확인 중, true: 연결됨, false: 연결 끊김
+  let pending = [];            // 아직 시트로 보내지 못한 작업
+  let flushing = false;
+
   function lsLoad(){ try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch(e){ return []; } }
   function lsSave(){ try { localStorage.setItem(LS_KEY, JSON.stringify(runs)); } catch(e){} }
+  function pendLoad(){ try { return JSON.parse(localStorage.getItem(PEND_KEY) || '[]'); } catch(e){ return []; } }
+  function pendSave(){ try { localStorage.setItem(PEND_KEY, JSON.stringify(pending)); } catch(e){} }
+
   function setStore(){
-    const el=$('store'); el.classList.toggle('shared', shared);
-    $('storeTxt').textContent = shared ? `공유 저장소 연결됨 · ${runs.length}명` : `이 기기에 저장 · ${runs.length}명`;
+    const el = $('store');
+    let txt, on = false;
+    if (mode === 'sheet'){
+      const wait = pending.length ? ` · 전송 대기 ${pending.length}건` : '';
+      if (sheetOk === null) txt = `스프레드시트 연결 중… · ${runs.length}명`;
+      else if (sheetOk){ txt = `스프레드시트 연결됨 · ${runs.length}명${wait}`; on = true; }
+      else txt = `스프레드시트 연결 끊김 (이 기기에 임시 저장) · ${runs.length}명${wait}`;
+    } else if (mode === 'db'){ txt = `공유 저장소 연결됨 · ${runs.length}명`; on = true; }
+    else txt = `이 기기에 저장 · ${runs.length}명`;
+    el.classList.toggle('shared', on);
+    $('storeTxt').textContent = txt;
   }
   function sanitize(d, id){
     const p = Array.isArray(d.p) ? d.p.slice(0,15).map(x => (typeof x==='number' && isFinite(x)) ? x : null) : [];
     while (p.length<15) p.push(null);
     const nn = p.filter(x=>x!=null); if (nn.length && nn.reduce((a,b)=>a+b,0)/nn.length > 20) for (let i=0;i<15;i++) if (p[i]!=null) p[i] = p[i]/101.325;
-    return {id, name: String(d.name||'참가자').slice(0,20), t: Number(d.t)||0, p};
+    return {id: String(id), name: String(d.name||'참가자').slice(0,20), t: Number(d.t)||0, p};
   }
+  function rerender(){
+    setStore();
+    if ($('modal').classList.contains('on')) renderRuns();
+    if ($('s2').classList.contains('on')) renderAll();
+  }
+
+  /* --- Google 스프레드시트 --- */
+  async function withTimeout(promiseFn, ms){
+    const ac = new AbortController(); const t = setTimeout(()=>ac.abort(), ms);
+    try { return await promiseFn(ac.signal); } finally { clearTimeout(t); }
+  }
+  async function sheetGet(){
+    return withTimeout(async signal => {
+      const res = await fetch(SHEET_URL + '?t=' + Date.now(), {cache:'no-store', redirect:'follow', signal});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const arr = await res.json();
+      if (!Array.isArray(arr)) throw new Error('bad data');
+      return arr;
+    }, 10000);
+  }
+  async function sheetPost(body){
+    return withTimeout(async signal => {
+      // text/plain 으로 보내야 브라우저 사전 요청(CORS preflight) 없이 Apps Script에 전달됩니다.
+      const res = await fetch(SHEET_URL, {method:'POST', redirect:'follow', signal,
+        headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body)});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+    }, 15000);
+  }
+  function applyPending(remote){
+    const m = new Map(remote.map(r => [r.id, r]));
+    for (const op of pending){
+      if (op.action === 'save') m.set(op.run.id, op.run);
+      else if (op.action === 'delete') m.delete(op.id);
+      else if (op.action === 'clear') m.clear();
+    }
+    return [...m.values()].sort((a,b)=>a.t-b.t);
+  }
+  let refreshing = null;
+  function sheetRefresh(){
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
+      try {
+        const arr = await sheetGet();
+        sheetOk = true;
+        runs = applyPending(arr.filter(d => d && d.id).map(d => sanitize(d, d.id)));
+        lsSave();
+      } catch(e){ sheetOk = false; }
+      refreshing = null; rerender();
+      return sheetOk;
+    })();
+    return refreshing;
+  }
+  async function flush(){
+    if (flushing || !pending.length) return;
+    flushing = true;
+    while (pending.length){
+      const op = pending[0];
+      const body = op.action === 'save' ? {action:'save', id:op.run.id, name:op.run.name, t:op.run.t, p:op.run.p}
+                 : op.action === 'delete' ? {action:'delete', id:op.id} : {action:'clear'};
+      try { await sheetPost(body); pending.shift(); pendSave(); sheetOk = true; }
+      catch(e){ sheetOk = false; break; }
+    }
+    flushing = false; setStore();
+  }
+  function enqueue(op){
+    if (op.action === 'save') pending = pending.filter(o => !(o.action==='save' && o.run.id===op.run.id));
+    if (op.action === 'delete') pending = pending.filter(o => !(o.action==='save' && o.run.id===op.id));
+    if (op.action === 'clear') pending = [];
+    pending.push(op); pendSave(); setStore();
+    flush();
+  }
+
+  /* --- 저장 · 삭제 --- */
   async function saveRun(run){
     const i = runs.findIndex(r=>r.id===run.id);
     if (i>=0) runs[i]=run; else runs.push(run);
-    if (shared && db){
+    if (mode === 'sheet'){ lsSave(); enqueue({action:'save', run}); }
+    else if (mode === 'db' && db){
       try { await db.collection('runs').doc(run.id).set({name:run.name, t:run.t, p:run.p}); }
       catch(e){
-        if (e && e.code==='unavailable'){ try{ await new Promise(r=>setTimeout(r,400+Math.random()*600)); await db.collection('runs').doc(run.id).set({name:run.name,t:run.t,p:run.p}); return; }catch(_){} }
-        shared=false; toast('공유 저장에 실패해 이 기기에 저장했어요.'); lsSave();
+        if (e && e.code==='unavailable'){ try{ await new Promise(r=>setTimeout(r,400+Math.random()*600)); await db.collection('runs').doc(run.id).set({name:run.name,t:run.t,p:run.p}); setStore(); return; }catch(_){} }
+        mode='local'; toast('공유 저장에 실패해 이 기기에 저장했어요.'); lsSave();
       }
     } else lsSave();
     setStore();
   }
   async function deleteRun(id){
     runs = runs.filter(r=>r.id!==id);
-    if (shared && db){ try { await db.collection('runs').doc(id).delete(); } catch(e){ toast('삭제하지 못했어요.'); } }
+    if (mode === 'sheet'){ lsSave(); enqueue({action:'delete', id}); }
+    else if (mode === 'db' && db){ try { await db.collection('runs').doc(id).delete(); } catch(e){ toast('삭제하지 못했어요.'); } }
+    else lsSave();
+    setStore(); renderRuns();
+  }
+  async function clearRuns(){
+    const ids = runs.map(r=>r.id);
+    runs = [];
+    if (mode === 'sheet'){ lsSave(); enqueue({action:'clear'}); }
+    else if (mode === 'db' && db){ for (const id of ids){ try { await db.collection('runs').doc(id).delete(); } catch(_){} } }
     else lsSave();
     setStore(); renderRuns();
   }
 
-  runs = lsLoad(); setStore();
-  (async () => {
-    try {
-      if (!window.claude || typeof window.claude.use !== 'function') return;
-      const d = await window.claude.use('db');
-      if (!d) return;
-      db = d;
-      let first = true;
-      const timer = setTimeout(()=>{ if (first) $('storeTxt').textContent = `공유 저장소 응답 대기 중 · 이 기기 ${runs.length}명`; }, 10000);
-      db.collection('runs').onSnapshot(snap => {
-        clearTimeout(timer); first=false; shared = true;
-        runs = snap.docs.map(doc => sanitize(doc.data()||{}, doc.id)).sort((a,b)=>a.t-b.t);
-        setStore();
-        if ($('modal').classList.contains('on')) renderRuns();
-        if ($('s2').classList.contains('on')) renderAll();
-      }, err => { clearTimeout(timer); shared=false; db=null; runs=lsLoad(); setStore(); });
-    } catch(e){ /* stay local */ }
-  })();
+  /* --- 시작 --- */
+  runs = lsLoad();
+  const inClaude = !!(window.claude && typeof window.claude.use === 'function');
+  if (SHEET_URL && !inClaude){
+    mode = 'sheet';
+    pending = pendLoad();
+    runs = applyPending(runs);
+    setStore();
+    sheetRefresh().then(() => flush());
+    setInterval(() => {
+      flush();
+      if ($('s2').classList.contains('on') || $('modal').classList.contains('on')) sheetRefresh();
+    }, 20000);
+    window.addEventListener('online', () => { flush().then(sheetRefresh); });
+  } else {
+    setStore();
+    (async () => {
+      try {
+        if (!inClaude) return;
+        const d = await window.claude.use('db');
+        if (!d) return;
+        db = d;
+        let first = true;
+        const timer = setTimeout(()=>{ if (first) $('storeTxt').textContent = `공유 저장소 응답 대기 중 · 이 기기 ${runs.length}명`; }, 10000);
+        db.collection('runs').onSnapshot(snap => {
+          clearTimeout(timer); first=false; mode = 'db';
+          runs = snap.docs.map(doc => sanitize(doc.data()||{}, doc.id)).sort((a,b)=>a.t-b.t);
+          rerender();
+        }, err => { clearTimeout(timer); mode='local'; db=null; runs=lsLoad(); setStore(); });
+      } catch(e){ /* stay local */ }
+    })();
+  }
 
   /* ---------- admin ---------- */
   function renderRuns(){
@@ -656,7 +773,7 @@
     if (b.classList.contains('confirm')) deleteRun(b.dataset.id);
     else { b.classList.add('confirm'); b.textContent='정말 삭제'; setTimeout(()=>{ if(b.isConnected){ b.classList.remove('confirm'); b.textContent='삭제'; } }, 3000); }
   });
-  $('adminBtn').onclick = () => { renderRuns(); $('modal').classList.add('on'); };
+  $('adminBtn').onclick = () => { renderRuns(); $('modal').classList.add('on'); if (mode==='sheet') sheetRefresh(); };
   $('closeModal').onclick = () => $('modal').classList.remove('on');
   $('modal').addEventListener('click', e => { if (e.target.id==='modal') $('modal').classList.remove('on'); });
   $('copyAll').onclick = async () => {
@@ -667,9 +784,7 @@
     const b = e.currentTarget;
     if (!b.dataset.c){ b.dataset.c='1'; b.textContent='정말 전체 삭제?'; setTimeout(()=>{ delete b.dataset.c; b.textContent='전체 삭제'; },3000); return; }
     delete b.dataset.c; b.textContent='전체 삭제';
-    const ids = runs.map(r=>r.id);
-    if (shared && db){ for (const id of ids){ try { await db.collection('runs').doc(id).delete(); } catch(_){} } }
-    runs=[]; lsSave(); setStore(); renderRuns(); toast('전체 삭제했어요.');
+    await clearRuns(); toast('전체 삭제했어요.');
   };
 
   fillGrid();
