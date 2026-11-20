@@ -276,6 +276,9 @@
   const C = {blue:'#2563EB', avg:'#E8681A', others:'#C7D0DC', grid:'#EEF2F7', tick:'#64748B', ink:'#0F172A'};
   const LS_KEY = 'boyle-runs-v1';
   const SAMPLE = ['ml\tatm','6\t3.041','7\t2.666','8\t2.431','9\t2.158','10\t1.942','11\t1.764','12\t1.636','13\t1.517','14\t1.405','15\t1.315','16\t1.236','17\t1.169','18\t1.11','19\t1.055','20\t0.993'].join('\n');
+  // 예시(테스트) 데이터와 값이 똑같은 기록인지 확인 → 평균에는 1번만 반영
+  const SAMPLE_P = (() => { const a = Array(15).fill(null); SAMPLE.split('\n').slice(1).forEach(l => { const [v,P] = l.split('\t').map(Number); a[20-v] = P; }); return a; })();
+  const isSample = p => Array.isArray(p) && p.length === 15 && p.every((x,i) => (x==null && SAMPLE_P[i]==null) || (x!=null && SAMPLE_P[i]!=null && Math.abs(x - SAMPLE_P[i]) < 1e-4));
 
   let values = Array(15).fill(null);   // my pressures (index ↔ VOLS)
   let currentId = null;                // saved run id for this participant
@@ -548,7 +551,12 @@
   }
 
   function renderAll(){
-    const valid = runs.filter(r => Array.isArray(r.p) && r.p.filter(x=>x!=null).length >= 3);
+    let sampleSeen = false;
+    const valid = runs.filter(r => {
+      if (!Array.isArray(r.p) || r.p.filter(x=>x!=null).length < 3) return false;
+      if (isSample(r.p)){ if (sampleSeen) return false; sampleSeen = true; }
+      return true;
+    });
     const avg = VOLS.map((_,i) => {
       const v = valid.map(r=>r.p[i]).filter(x=>x!=null && isFinite(x));
       return v.length ? v.reduce((a,b)=>a+b,0)/v.length : null;
@@ -777,7 +785,7 @@
     if (!runs.length){ body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">저장된 데이터가 없어요.</td></tr>'; }
     else body.innerHTML = runs.map((r,i) => {
       const st = stats(r.p); const t = r.t ? new Date(r.t).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
-      return `<tr><td>${i+1}</td><td>${esc(r.name)}</td><td>${t}</td><td class="n">${st.n}</td><td class="n">${fmt(st.mean,2)}</td><td style="text-align:right"><button class="del" data-id="${esc(r.id)}">삭제</button></td></tr>`;
+      return `<tr><td>${i+1}</td><td>${esc(r.name)}${isSample(r.p) ? ' <span style="font-size:11px;color:#B45309;background:#FEF3C7;border-radius:6px;padding:1px 6px">예시</span>' : ''}</td><td>${t}</td><td class="n">${st.n}</td><td class="n">${fmt(st.mean,2)}</td><td style="text-align:right"><button class="del" data-id="${esc(r.id)}">삭제</button></td></tr>`;
     }).join('');
     const head = ['이름','시간', ...VOLS.map(v=>`${v}mL`)].join(',');
     $('exportTxt').value = [head, ...runs.map(r => [`"${r.name.replace(/"/g,'""')}"`, r.t?new Date(r.t).toISOString():'', ...r.p.map(x=>x==null?'':x)].join(','))].join('\n');
